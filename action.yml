@@ -1,0 +1,484 @@
+name: 'Attestry Compliance Check'
+description: 'Check AI system compliance against EU AI Act, Colorado AI Act, NIST AI RMF, and ISO 42001'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  api-key:
+    description: 'Attestry API key (starts with rs_)'
+    required: true
+  system-id:
+    description: 'AI system UUID to check'
+    required: true
+  min-score:
+    description: 'Minimum compliance score (0-100) to pass the gate'
+    required: false
+    default: '70'
+  fail-on-gaps:
+    description: 'Fail the check if any critical compliance gaps exist'
+    required: false
+    default: 'true'
+  fail-on-missing-assessment:
+    description: 'Fail if no completed assessment exists for the system'
+    required: false
+    default: 'true'
+  frameworks:
+    description: 'Comma-separated list of frameworks to check (e.g. "eu-ai-act,nist-ai-rmf")'
+    required: false
+    default: ''
+  api-url:
+    description: 'Attestry API base URL (override for self-hosted or staging)'
+    required: false
+    default: 'https://attestry.app'
+  comment-on-pr:
+    description: 'Post a compliance summary comment on the PR (requires GITHUB_TOKEN)'
+    required: false
+    default: 'true'
+  attestation-id:
+    description: |
+      Attestation / build identifier used by the Ship-Gate Integration
+      (Prompt E.2). When set, the action additionally calls
+      POST /api/v1/ship-gate/check with this ID + system-id and fails
+      the build if a multi-approver chain has not yet released the
+      attestation. Leave empty to skip the ship-gate step entirely
+      (default; backward-compatible with Prompt 14).
+    required: false
+    default: ''
+
+outputs:
+  gate:
+    description: 'Gate result: "pass" or "fail"'
+    value: ${{ steps.check.outputs.gate }}
+  score:
+    description: 'Compliance score (0-100, or "null" if no assessment)'
+    value: ${{ steps.check.outputs.score }}
+  gap-count:
+    description: 'Total number of unresolved compliance gaps'
+    value: ${{ steps.check.outputs.gap_count }}
+  critical-gaps:
+    description: 'Number of critical-priority gaps'
+    value: ${{ steps.check.outputs.critical_gaps }}
+  high-gaps:
+    description: 'Number of high-priority gaps'
+    value: ${{ steps.check.outputs.high_gaps }}
+  assessment-id:
+    description: 'ID of the assessment that was checked'
+    value: ${{ steps.check.outputs.assessment_id }}
+  assessment-date:
+    description: 'Date the assessment was completed'
+    value: ${{ steps.check.outputs.assessment_date }}
+  reason:
+    description: 'Human-readable reason for the gate result'
+    value: ${{ steps.check.outputs.reason }}
+  ship-gated:
+    description: 'Ship-gate result: "true" if build is blocked, "false" otherwise (only set when attestation-id is provided)'
+    value: ${{ steps.ship_gate.outputs.ship_gated }}
+  ship-gate-reason:
+    description: 'Ship-gate stable reason code: "awaiting_approvers" | "rejected" | "timed_out" | empty when not gated'
+    value: ${{ steps.ship_gate.outputs.ship_gate_reason }}
+  ship-gate-state:
+    description: 'Ship-gate resolved state: "gated" | "released" | "rejected" | "timed_out"'
+    value: ${{ steps.ship_gate.outputs.ship_gate_state }}
+  approvers-pending:
+    description: 'Comma-separated user IDs still owed a decision before the gate releases (empty when not gated)'
+    value: ${{ steps.ship_gate.outputs.approvers_pending }}
+  execution-id:
+    description: 'Approval-chain execution ID backing the ship-gate (empty when no gate exists)'
+    value: ${{ steps.ship_gate.outputs.execution_id }}
+  chain-id:
+    description: 'Approval-chain template ID backing the execution (empty when no gate exists)'
+    value: ${{ steps.ship_gate.outputs.chain_id }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check compliance
+      id: check
+      shell: bash
+      env:
+        ATTESTRY_API_KEY: ${{ inputs.api-key }}
+        ATTESTRY_SYSTEM_ID: ${{ inputs.system-id }}
+        ATTESTRY_MIN_SCORE: ${{ inputs.min-score }}
+        ATTESTRY_FAIL_ON_GAPS: ${{ inputs.fail-on-gaps }}
+        ATTESTRY_FAIL_ON_MISSING: ${{ inputs.fail-on-missing-assessment }}
+        ATTESTRY_FRAMEWORKS: ${{ inputs.frameworks }}
+        ATTESTRY_API_URL: ${{ inputs.api-url }}
+      run: |
+        set -euo pipefail
+
+        # ── Build request body ──────────────────────────────────────────
+        BODY=$(jq -n \
+          --arg sid "$ATTESTRY_SYSTEM_ID" \
+          --argjson min "$ATTESTRY_MIN_SCORE" \
+          --argjson fom "$( [ "$ATTESTRY_FAIL_ON_MISSING" = "true" ] && echo true || echo false )" \
+          '{systemId: $sid, minScore: $min, failOnMissingAssessment: $fom}')
+
+        # Add frameworks array if provided
+        if [ -n "$ATTESTRY_FRAMEWORKS" ]; then
+          FW_JSON=$(echo "$ATTESTRY_FRAMEWORKS" | tr ',' '\n' | jq -R . | jq -s .)
+          BODY=$(echo "$BODY" | jq --argjson fw "$FW_JSON" '. + {frameworks: $fw}')
+        fi
+
+        echo "::group::Attestry Compliance Gate"
+        echo "System ID: $ATTESTRY_SYSTEM_ID"
+        echo "Min score: $ATTESTRY_MIN_SCORE"
+        echo "API URL:   $ATTESTRY_API_URL"
+        echo "::endgroup::"
+
+        # ── Call the gate endpoint ──────────────────────────────────────
+        HTTP_CODE=$(curl -s -o /tmp/attestry_response.json -w "%{http_code}" \
+          -X POST "${ATTESTRY_API_URL}/api/v1/gate" \
+          -H "x-api-key: ${ATTESTRY_API_KEY}" \
+          -H "Content-Type: application/json" \
+          -d "$BODY" \
+          --max-time 30)
+
+        if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+          echo "::error::Attestry API returned HTTP $HTTP_CODE"
+          cat /tmp/attestry_response.json 2>/dev/null || true
+          exit 1
+        fi
+
+        RESPONSE=$(cat /tmp/attestry_response.json)
+        DATA=$(echo "$RESPONSE" | jq -r '.data // empty')
+
+        if [ -z "$DATA" ]; then
+          echo "::error::Attestry API returned unexpected response format"
+          echo "$RESPONSE"
+          exit 1
+        fi
+
+        # ── Parse response ──────────────────────────────────────────────
+        GATE=$(echo "$DATA" | jq -r '.gate')
+        SCORE=$(echo "$DATA" | jq -r '.score // "null"')
+        SYSTEM_NAME=$(echo "$DATA" | jq -r '.systemName // "Unknown"')
+        REASON=$(echo "$DATA" | jq -r '.reason // "No reason provided"')
+        GAP_COUNT=$(echo "$DATA" | jq -r '.gapCount // 0')
+        CRITICAL_GAPS=$(echo "$DATA" | jq -r '.criticalGaps // 0')
+        HIGH_GAPS=$(echo "$DATA" | jq -r '.highGaps // 0')
+        ASSESSMENT_ID=$(echo "$DATA" | jq -r '.assessmentId // "none"')
+        ASSESSMENT_DATE=$(echo "$DATA" | jq -r '.assessmentDate // "none"')
+        MIN_SCORE=$(echo "$DATA" | jq -r '.minScore')
+        FRAMEWORKS=$(echo "$DATA" | jq -r '.frameworks | join(", ") // "all"')
+
+        # ── Set outputs ─────────────────────────────────────────────────
+        echo "gate=${GATE}" >> "$GITHUB_OUTPUT"
+        echo "score=${SCORE}" >> "$GITHUB_OUTPUT"
+        echo "gap_count=${GAP_COUNT}" >> "$GITHUB_OUTPUT"
+        echo "critical_gaps=${CRITICAL_GAPS}" >> "$GITHUB_OUTPUT"
+        echo "high_gaps=${HIGH_GAPS}" >> "$GITHUB_OUTPUT"
+        echo "assessment_id=${ASSESSMENT_ID}" >> "$GITHUB_OUTPUT"
+        echo "assessment_date=${ASSESSMENT_DATE}" >> "$GITHUB_OUTPUT"
+        echo "reason=${REASON}" >> "$GITHUB_OUTPUT"
+
+        # ── Print formatted summary ─────────────────────────────────────
+        if [ "$GATE" = "pass" ]; then
+          ICON="[PASS]"
+        else
+          ICON="[FAIL]"
+        fi
+
+        echo ""
+        echo "======================================================"
+        echo "  Attestry Compliance Gate — ${ICON}"
+        echo "======================================================"
+        echo ""
+        echo "  System:      ${SYSTEM_NAME} (${ATTESTRY_SYSTEM_ID})"
+        echo "  Score:       ${SCORE} / 100  (minimum: ${MIN_SCORE})"
+        echo "  Frameworks:  ${FRAMEWORKS}"
+        echo "  Assessment:  ${ASSESSMENT_ID}"
+        echo "  Date:        ${ASSESSMENT_DATE}"
+        echo ""
+        echo "  Gaps:        ${GAP_COUNT} total"
+        echo "    Critical:  ${CRITICAL_GAPS}"
+        echo "    High:      ${HIGH_GAPS}"
+        echo ""
+        echo "  Result:      ${GATE^^}"
+        echo "  Reason:      ${REASON}"
+        echo ""
+        echo "======================================================"
+
+        # ── Write job summary ───────────────────────────────────────────
+        if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+          if [ "$GATE" = "pass" ]; then
+            BADGE="![pass](https://img.shields.io/badge/Attestry-PASS-brightgreen)"
+          else
+            BADGE="![fail](https://img.shields.io/badge/Attestry-FAIL-red)"
+          fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY
+        ### Attestry Compliance Gate ${BADGE}
+
+        | Field | Value |
+        |-------|-------|
+        | System | **${SYSTEM_NAME}** |
+        | Score | **${SCORE}** / 100 (min: ${MIN_SCORE}) |
+        | Frameworks | ${FRAMEWORKS} |
+        | Gaps | ${GAP_COUNT} total (${CRITICAL_GAPS} critical, ${HIGH_GAPS} high) |
+        | Assessment | \`${ASSESSMENT_ID}\` |
+        | Date | ${ASSESSMENT_DATE} |
+        | **Result** | **${GATE^^}** |
+        | Reason | ${REASON} |
+        SUMMARY
+        fi
+
+        # ── List gaps if any ────────────────────────────────────────────
+        if [ "$GAP_COUNT" -gt 0 ]; then
+          echo ""
+          echo "Unresolved compliance gaps:"
+          echo "$DATA" | jq -r '.gaps[] | "  [\(.priority)] \(.requirementKey): \(.title) (\(.status))"'
+
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "<details><summary>Unresolved gaps (${GAP_COUNT})</summary>" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Priority | Requirement | Title | Status |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|----------|-------------|-------|--------|" >> "$GITHUB_STEP_SUMMARY"
+            echo "$DATA" | jq -r '.gaps[] | "| \(.priority) | \(.requirementKey) | \(.title) | \(.status) |"' >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+          fi
+        fi
+
+        # ── Determine exit code ─────────────────────────────────────────
+        EXIT_CODE=0
+
+        if [ "$GATE" = "fail" ]; then
+          EXIT_CODE=1
+        fi
+
+        # Fail on critical gaps even if score passes
+        if [ "$ATTESTRY_FAIL_ON_GAPS" = "true" ] && [ "$CRITICAL_GAPS" -gt 0 ]; then
+          echo "::error::${CRITICAL_GAPS} critical compliance gap(s) found"
+          EXIT_CODE=1
+        fi
+
+        exit $EXIT_CODE
+
+    - name: Ship-gate check
+      id: ship_gate
+      if: ${{ inputs.attestation-id != '' }}
+      shell: bash
+      env:
+        ATTESTRY_API_KEY: ${{ inputs.api-key }}
+        ATTESTRY_SYSTEM_ID: ${{ inputs.system-id }}
+        ATTESTRY_ATTESTATION_ID: ${{ inputs.attestation-id }}
+        ATTESTRY_API_URL: ${{ inputs.api-url }}
+      run: |
+        set -euo pipefail
+
+        # ── H4 fix: strip trailing slashes from API URL ─────────────────
+        # Without this, "${API_URL}/api/v1/..." becomes "...//api/v1/..."
+        # when API_URL has a trailing slash. Some servers / reverse
+        # proxies 404 on double-slash paths.
+        API_BASE="${ATTESTRY_API_URL%/}"
+
+        # ── Build request body ──────────────────────────────────────────
+        BODY=$(jq -n \
+          --arg sid "$ATTESTRY_SYSTEM_ID" \
+          --arg aid "$ATTESTRY_ATTESTATION_ID" \
+          '{systemId: $sid, attestationId: $aid}')
+
+        echo "::group::Attestry Ship-Gate"
+        echo "System ID:      $ATTESTRY_SYSTEM_ID"
+        echo "Attestation ID: $ATTESTRY_ATTESTATION_ID"
+        echo "API URL:        $API_BASE"
+        echo "::endgroup::"
+
+        # ── Call /check ─────────────────────────────────────────────────
+        # H3 fix: append `|| echo 000` so curl's non-zero exit (timeout,
+        # DNS fail, connection refused) doesn't kill the script via
+        # `set -e` — instead we get HTTP_CODE=000 and fall into the
+        # error branch with a clean message.
+        HTTP_CODE=$(curl -s -o /tmp/attestry_ship_gate.json -w "%{http_code}" \
+          -X POST "${API_BASE}/api/v1/ship-gate/check" \
+          -H "x-api-key: ${ATTESTRY_API_KEY}" \
+          -H "Content-Type: application/json" \
+          -d "$BODY" \
+          --max-time 30 || echo 000)
+
+        RESPONSE=$(cat /tmp/attestry_ship_gate.json 2>/dev/null || echo '{}')
+
+        # M1 fix: helper to write GH output values with newlines stripped.
+        # Server returns stable codes (no newlines) but defense-in-depth
+        # against buggy/malicious upstream that could break the output
+        # file's "k=v" line format.
+        write_out() {
+          local key="$1"
+          local val="${2//$'\n'/ }"
+          val="${val//$'\r'/ }"
+          echo "${key}=${val}" >> "$GITHUB_OUTPUT"
+        }
+
+        # ── HTTP error handling (surface as gated:true) ─────────────────
+        if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+          API_ERR=$(echo "$RESPONSE" | jq -r '.error // empty' 2>/dev/null || echo "")
+          MSG="API error: HTTP ${HTTP_CODE}"
+          if [ -n "$API_ERR" ]; then
+            MSG="${MSG}: ${API_ERR}"
+          fi
+          echo "::error::Attestry ship-gate ${MSG}"
+          write_out "ship_gated" "true"
+          write_out "ship_gate_reason" "${MSG}"
+          write_out "ship_gate_state" ""
+          write_out "approvers_pending" ""
+          write_out "execution_id" ""
+          write_out "chain_id" ""
+          exit 1
+        fi
+
+        # ── Parse response ──────────────────────────────────────────────
+        DATA=$(echo "$RESPONSE" | jq -r '.data // empty' 2>/dev/null || echo "")
+        if [ -z "$DATA" ]; then
+          echo "::error::Attestry ship-gate returned an unexpected response shape"
+          echo "$RESPONSE"
+          write_out "ship_gated" "true"
+          write_out "ship_gate_reason" "API returned malformed response"
+          write_out "ship_gate_state" ""
+          write_out "approvers_pending" ""
+          write_out "execution_id" ""
+          write_out "chain_id" ""
+          exit 1
+        fi
+
+        GATED=$(echo "$DATA" | jq -r '.gated' 2>/dev/null || echo "")
+        REASON=$(echo "$DATA" | jq -r '.reason // ""' 2>/dev/null || echo "")
+        STATE=$(echo "$DATA" | jq -r '.state // ""' 2>/dev/null || echo "")
+        PENDING=$(echo "$DATA" | jq -r '(.approvers_pending // []) | join(", ")' 2>/dev/null || echo "")
+        EXEC_ID=$(echo "$DATA" | jq -r '.executionId // ""' 2>/dev/null || echo "")
+        CHAIN_ID=$(echo "$DATA" | jq -r '.chainId // ""' 2>/dev/null || echo "")
+
+        # ── H2 fix: explicit GATED-validity check (fail closed on garbage)
+        # If the API returns 200 with a malformed body where `gated` isn't
+        # the literal string "true" or "false", we cannot trust the gate
+        # result. Treat as gated:true with a clear error rather than
+        # silently letting the build proceed.
+        if [ "$GATED" != "true" ] && [ "$GATED" != "false" ]; then
+          echo "::error::Attestry ship-gate returned non-boolean gated value: '${GATED}'"
+          write_out "ship_gated" "true"
+          write_out "ship_gate_reason" "Malformed response: gated was '${GATED}'"
+          write_out "ship_gate_state" ""
+          write_out "approvers_pending" ""
+          write_out "execution_id" ""
+          write_out "chain_id" ""
+          exit 1
+        fi
+
+        # ── Set outputs ─────────────────────────────────────────────────
+        write_out "ship_gated" "${GATED}"
+        write_out "ship_gate_reason" "${REASON}"
+        write_out "ship_gate_state" "${STATE}"
+        write_out "approvers_pending" "${PENDING}"
+        write_out "execution_id" "${EXEC_ID}"
+        write_out "chain_id" "${CHAIN_ID}"
+
+        # ── Print formatted summary ─────────────────────────────────────
+        if [ "$GATED" = "true" ]; then
+          ICON="[BLOCKED]"
+        else
+          ICON="[PASS]"
+        fi
+
+        echo ""
+        echo "======================================================"
+        echo "  Attestry Ship-Gate — ${ICON}"
+        echo "======================================================"
+        echo ""
+        echo "  System:        ${ATTESTRY_SYSTEM_ID}"
+        echo "  Attestation:   ${ATTESTRY_ATTESTATION_ID}"
+        echo "  Gated:         ${GATED}"
+        [ -n "$STATE" ] && echo "  State:         ${STATE}"
+        [ -n "$REASON" ] && echo "  Reason:        ${REASON}"
+        [ -n "$PENDING" ] && echo "  Pending:       ${PENDING}"
+        [ -n "$EXEC_ID" ] && echo "  Execution:     ${EXEC_ID}"
+        [ -n "$CHAIN_ID" ] && echo "  Chain:         ${CHAIN_ID}"
+        echo ""
+        echo "======================================================"
+
+        # ── Write Job Summary ───────────────────────────────────────────
+        if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+          if [ "$GATED" = "true" ]; then
+            BADGE="![blocked](https://img.shields.io/badge/Ship--Gate-BLOCKED-red)"
+          else
+            BADGE="![pass](https://img.shields.io/badge/Ship--Gate-PASS-brightgreen)"
+          fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY
+
+        ### Attestry Ship-Gate ${BADGE}
+
+        | Field | Value |
+        |-------|-------|
+        | System | \`${ATTESTRY_SYSTEM_ID}\` |
+        | Attestation | \`${ATTESTRY_ATTESTATION_ID}\` |
+        | Gated | **${GATED}** |
+        | State | ${STATE:-—} |
+        | Reason | ${REASON:-—} |
+        | Pending approvers | ${PENDING:-—} |
+        SUMMARY
+        fi
+
+        # ── Determine exit code ─────────────────────────────────────────
+        if [ "$GATED" = "true" ]; then
+          if [ -z "$REASON" ]; then
+            REASON="unknown"
+          fi
+          echo "::error::Build is gated by Attestry ship-gate (${REASON})"
+          exit 1
+        fi
+
+    - name: Comment on PR
+      if: ${{ inputs.comment-on-pr == 'true' && github.event_name == 'pull_request' && always() }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GATE: ${{ steps.check.outputs.gate }}
+        SCORE: ${{ steps.check.outputs.score }}
+        GAP_COUNT: ${{ steps.check.outputs.gap_count }}
+        CRITICAL_GAPS: ${{ steps.check.outputs.critical_gaps }}
+        HIGH_GAPS: ${{ steps.check.outputs.high_gaps }}
+        REASON: ${{ steps.check.outputs.reason }}
+        ATTESTRY_SYSTEM_ID: ${{ inputs.system-id }}
+        ATTESTRY_MIN_SCORE: ${{ inputs.min-score }}
+      run: |
+        if [ -z "${GH_TOKEN:-}" ]; then
+          echo "No GITHUB_TOKEN available — skipping PR comment"
+          exit 0
+        fi
+
+        PR_NUMBER="${{ github.event.pull_request.number }}"
+        if [ -z "$PR_NUMBER" ]; then
+          echo "No PR number found — skipping PR comment"
+          exit 0
+        fi
+
+        if [ "$GATE" = "pass" ]; then
+          STATUS_ICON="PASS"
+          STATUS_COLOR="brightgreen"
+        else
+          STATUS_ICON="FAIL"
+          STATUS_COLOR="red"
+        fi
+
+        COMMENT_BODY="## Attestry Compliance Gate — ${STATUS_ICON}
+
+        | Field | Value |
+        |-------|-------|
+        | Score | **${SCORE}** / 100 (min: ${ATTESTRY_MIN_SCORE}) |
+        | Gaps | ${GAP_COUNT} total (${CRITICAL_GAPS} critical, ${HIGH_GAPS} high) |
+        | Result | **${GATE}** |
+        | Reason | ${REASON} |
+
+        ---
+        *Checked by [Attestry](https://attestry.ai) compliance gate*"
+
+        # Delete previous Attestry comments to avoid clutter
+        EXISTING=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+          --jq '.[] | select(.body | startswith("## Attestry Compliance Gate")) | .id' 2>/dev/null || true)
+
+        for COMMENT_ID in $EXISTING; do
+          gh api -X DELETE "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" 2>/dev/null || true
+        done
+
+        gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY" 2>/dev/null || echo "Could not post PR comment"

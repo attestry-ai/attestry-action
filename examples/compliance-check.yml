@@ -1,0 +1,77 @@
+# .github/workflows/compliance-check.yml
+#
+# Run the Attestry compliance gate on every PR and on pushes to main.
+# Blocks merges if the AI system's compliance score is below the threshold
+# or if critical compliance gaps exist.
+
+name: AI Compliance Check
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  pull-requests: write  # Required for PR comments
+
+jobs:
+  compliance-gate:
+    name: Attestry Compliance Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check AI compliance
+        id: attestry
+        uses: attestry-ai/attestry-action@v1  # or: your-org/your-repo/github-action@main
+        with:
+          api-key: ${{ secrets.ATTESTRY_API_KEY }}
+          system-id: ${{ vars.AI_SYSTEM_ID }}     # Set in repo variables
+          min-score: '75'
+          fail-on-gaps: 'true'
+          frameworks: 'eu-ai-act,nist-ai-rmf'
+
+      # Optional: use outputs in downstream steps
+      - name: Print results
+        if: always()
+        run: |
+          echo "Gate:     ${{ steps.attestry.outputs.gate }}"
+          echo "Score:    ${{ steps.attestry.outputs.score }}"
+          echo "Gaps:     ${{ steps.attestry.outputs.gap-count }}"
+          echo "Critical: ${{ steps.attestry.outputs.critical-gaps }}"
+
+  # Example: multi-system check
+  compliance-multi:
+    name: Check All AI Systems
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        system:
+          - id: '00000000-0000-0000-0000-000000000001'
+            name: 'Recommendation Engine'
+            min-score: '80'
+          - id: '00000000-0000-0000-0000-000000000002'
+            name: 'Credit Scoring Model'
+            min-score: '90'
+    steps:
+      - name: "Check: ${{ matrix.system.name }}"
+        uses: attestry-ai/attestry-action@v1
+        with:
+          api-key: ${{ secrets.ATTESTRY_API_KEY }}
+          system-id: ${{ matrix.system.id }}
+          min-score: ${{ matrix.system.min-score }}
+          fail-on-gaps: 'true'
+
+  # Example: nightly compliance audit (non-blocking)
+  nightly-audit:
+    name: Nightly Compliance Audit
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - name: Audit compliance
+        uses: attestry-ai/attestry-action@v1
+        continue-on-error: true  # Non-blocking — just report
+        with:
+          api-key: ${{ secrets.ATTESTRY_API_KEY }}
+          system-id: ${{ vars.AI_SYSTEM_ID }}
+          min-score: '70'
+          fail-on-gaps: 'false'
