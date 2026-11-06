@@ -30,7 +30,7 @@ inputs:
   api-url:
     description: 'Attestry API base URL (override for self-hosted or staging)'
     required: false
-    default: 'https://attestry.app'
+    default: 'https://attestry.ai'
   comment-on-pr:
     description: 'Post a compliance summary comment on the PR (requires GITHUB_TOKEN)'
     required: false
