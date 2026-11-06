@@ -38,7 +38,7 @@ jobs:
 | `fail-on-gaps` | No | `true` | Fail the check if any **critical** compliance gaps exist, even if the score passes. |
 | `fail-on-missing-assessment` | No | `true` | Fail if no completed assessment exists for the system. |
 | `frameworks` | No | `''` | Comma-separated frameworks to check (e.g. `eu-ai-act,colorado-ai-act,nist-ai-rmf,iso-42001`). Empty = all. |
-| `api-url` | No | `https://attestry.app` | Override for self-hosted or staging environments. |
+| `api-url` | No | `https://attestry.ai` | Override for self-hosted or staging environments. |
 | `comment-on-pr` | No | `true` | Post a compliance summary comment on pull requests. |
 | `attestation-id` | No | `''` | Attestation / build identifier for the **Ship-Gate Integration**. When set, the action additionally calls `POST /api/v1/ship-gate/check` and fails the build if a multi-approver workflow has not yet released the attestation. Leave empty to skip the ship-gate step. |
 
@@ -193,7 +193,7 @@ Or use a dynamic badge tied to your latest workflow run:
 
 ## Setup
 
-1. **Get an API key** — sign up at [attestry.app](https://attestry.app) and create an API key with `read:assessments` and `read:systems` permissions.
+1. **Get an API key** — sign up at [attestry.ai](https://attestry.ai) and create an API key with `read:assessments` and `read:systems` permissions.
 2. **Add the secret** — go to your repository Settings > Secrets > Actions and add `ATTESTRY_API_KEY`.
 3. **Find your system ID** — in the Attestry dashboard, go to AI Systems and copy the UUID.
 4. **Add the workflow** — create `.github/workflows/compliance.yml` using the quick start example above.
